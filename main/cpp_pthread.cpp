@@ -1,111 +1,132 @@
-/* pthread/std::thread example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-
 #include <iostream>
 #include <thread>
 #include <chrono>
-#include <memory>
 #include <string>
-#include <sstream>
-#include <esp_pthread.h>
+#include <format>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
+#include <esp_pthread.h>
 
-using namespace std::chrono;
+// --- C++23 Goodies ---
+using namespace std::chrono_literals;
+constexpr auto sleep_duration = 5s;
 
-const auto sleep_time = seconds {
-    5
-};
-
-void print_thread_info(const char *extra = nullptr)
+// Helper to reliably log formatted string using ESP_LOGI
+auto print_thread_info(const char *task_name, const std::string_view extra = "") -> void
 {
-    std::stringstream ss;
-    if (extra) {
-        ss << extra;
-    }
-    ss << "Core id: " << xPortGetCoreID()
-       << ", prio: " << uxTaskPriorityGet(nullptr)
-       << ", minimum free stack: " << uxTaskGetStackHighWaterMark(nullptr) << " bytes.";
-    ESP_LOGI(pcTaskGetName(nullptr), "%s", ss.str().c_str());
+    // C++23: Uses std::format for cleaner string creation than stringstream
+    const std::string log_message = std::format(
+        "{}{}Core id: {}, prio: {}, min free stack: {} bytes.",
+        extra,
+        !extra.empty() ? " " : "", // Add space if extra is present
+        xPortGetCoreID(),
+        uxTaskPriorityGet(nullptr),
+        uxTaskGetStackHighWaterMark(nullptr)
+    );
+    ESP_LOGI(task_name, "%s", log_message.c_str());
 }
 
-void thread_func_inherited()
+// --- Thread Functions ---
+
+auto thread_func_inherited() -> void
 {
+    const char* const name = pcTaskGetName(nullptr);
     while (true) {
-        print_thread_info("This is the INHERITING thread with the same parameters as our parent, including name. ");
-        std::this_thread::sleep_for(sleep_time);
+        print_thread_info(name, "INHERITING thread (same params/name as parent).");
+        std::this_thread::sleep_for(sleep_duration);
     }
 }
 
-void spawn_another_thread()
+auto spawn_another_thread() -> void
 {
-    // Create a new thread, it will inherit our configuration
-    std::thread inherits(thread_func_inherited);
+    const char* const name = pcTaskGetName(nullptr);
+    
+    // C++11/14/17: Still using std::jthread, detached for embedded infinite loop
+    std::jthread inherits(thread_func_inherited);
+    inherits.detach();
 
     while (true) {
-        print_thread_info();
-        std::this_thread::sleep_for(sleep_time);
+        print_thread_info(name);
+        std::this_thread::sleep_for(sleep_duration);
     }
 }
 
-void thread_func_any_core()
+auto thread_func_any_core() -> void
 {
+    const char* const name = pcTaskGetName(nullptr);
     while (true) {
-        print_thread_info("This thread (with the default name) may run on any core.");
-        std::this_thread::sleep_for(sleep_time);
+        print_thread_info(name, "ANY_CORE thread (default config).");
+        std::this_thread::sleep_for(sleep_duration);
     }
 }
 
-void thread_func()
+auto thread_func() -> void
 {
+    const char* const name = pcTaskGetName(nullptr);
     while (true) {
-        print_thread_info();
-        std::this_thread::sleep_for(sleep_time);
+        print_thread_info(name);
+        std::this_thread::sleep_for(sleep_duration);
     }
 }
 
-esp_pthread_cfg_t create_config(const char *name, int core_id, int stack, int prio)
+// --- Configuration Helper ---
+
+// C++23: [[nodiscard]] attribute ensures the return value (the configuration) is used
+[[nodiscard]] esp_pthread_cfg_t create_config(const char *name, const int core_id, const size_t stack_size, const int prio, const bool inherit = false)
 {
     auto cfg = esp_pthread_get_default_config();
+    // Designated initializers are nice, but not possible when initializing a struct from a function call like get_default_config()
     cfg.thread_name = name;
     cfg.pin_to_core = core_id;
-    cfg.stack_size = stack;
+    cfg.stack_size = stack_size;
     cfg.prio = prio;
+    cfg.inherit_cfg = inherit;
     return cfg;
 }
 
 extern "C" void app_main(void)
 {
-    // Create a thread using default values that can run on any core
-    auto cfg = esp_pthread_get_default_config();
-    esp_pthread_set_cfg(&cfg);
-    std::thread any_core(thread_func_any_core);
+    // 1. Any Core Thread
+    // Use an immediately invoked lambda to set config and create thread cleanly
+    []() {
+        const auto cfg = esp_pthread_get_default_config();
+        esp_pthread_set_cfg(&cfg);
+        std::jthread any_core(thread_func_any_core);
+        any_core.detach();
+    }(); // IILE (Immediately Invoked Lambda Expression) C++11+
 
-    // Create a thread on core 0 that spawns another thread, they will both have the same name etc.
-    cfg = create_config("Thread 1", 0, 3 * 1024, 5);
-    cfg.inherit_cfg = true;
-    esp_pthread_set_cfg(&cfg);
-    std::thread thread_1(spawn_another_thread);
+    // 2. Core 0 Thread with Inheritance
+    []() {
+        const auto cfg = create_config(
+            "Thread 1",
+            0,
+            3 * 1024,
+            5,
+            true // Inherit config
+        );
+        esp_pthread_set_cfg(&cfg);
+        std::jthread thread_1(spawn_another_thread);
+        thread_1.detach();
+    }();
 
-    // Create a thread on core 1.
-    cfg = create_config("Thread 2", 1, 3 * 1024, 5);
-    esp_pthread_set_cfg(&cfg);
-    std::thread thread_2(thread_func);
-
-    // Let the main task do something too
+    // 3. Core 1 Thread
+    []() {
+        const auto cfg = create_config(
+            "Thread 2",
+            1,
+            3 * 1024,
+            5
+        );
+        esp_pthread_set_cfg(&cfg);
+        std::jthread thread_2(thread_func);
+        thread_2.detach();
+    }();
+    
+    // 4. Main Task Loop
+    const char* const main_task_name = pcTaskGetName(nullptr);
     while (true) {
-        std::stringstream ss;
-        ss << "core id: " << xPortGetCoreID()
-           << ", prio: " << uxTaskPriorityGet(nullptr)
-           << ", minimum free stack: " << uxTaskGetStackHighWaterMark(nullptr) << " bytes.";
-        ESP_LOGI(pcTaskGetName(nullptr), "%s", ss.str().c_str());
-        std::this_thread::sleep_for(sleep_time);
+        print_thread_info(main_task_name, "MAIN_TASK is running.");
+        std::this_thread::sleep_for(sleep_duration);
     }
 }
